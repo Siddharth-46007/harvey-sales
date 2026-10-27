@@ -60,3 +60,9 @@ harvey.local.yaml
 # Backups and in-progress writes from `harvey train` hold the same config.
 harvey.local.yaml.*
 harvey.yaml.*
+
+# Exported prospect lists — real contact data for real people. `harvey export`
+# writes ./prospects.csv by default (--out overrides) and the dashboard serves
+# prospects.csv / cohort.csv. Root-level only, so test fixtures under tests/
+# stay committable.
+/*.csv

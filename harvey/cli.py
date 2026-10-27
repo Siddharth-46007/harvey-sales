@@ -525,19 +525,132 @@ def cmd_profile(args):
     asyncio.run(_profile())
 
 
+def cmd_import_cbse(args):
+    """Import CBSE's affiliated-schools directory. Free, no credits."""
+    from harvey.state import StateManager
+    from harvey.config import load_config
+    from harvey.collectors.cbse import CBSEImporter
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        config = load_config()
+        wanted = [s.strip() for s in args.states.split(";") if s.strip()]
+
+        imp = CBSEImporter(state, config, interval=args.interval)
+        if args.dry_run:
+            t = await imp.run(states=wanted or None, dry_run=True)
+            print()
+            print(f"  {t['states']} state(s) would be fetched, "
+                  f"1 request each, {args.interval}s apart:")
+            for label in t.get("plan", []):
+                print(f"    - {label}")
+            print()
+            print("  Source: CBSE SARAS directory. Free, no API credits.")
+            print()
+            return
+
+        print()
+        print(f"  Importing the CBSE directory "
+              f"({args.interval}s between requests)...")
+        print()
+        t = await imp.run(states=wanted or None)
+        print(f"  CBSE DIRECTORY — {t['states']} states, {t['rows']} rows read")
+        print(f"    {t['new']} new schools stored")
+        print(f"    {t['known']} already known (skipped as duplicates)")
+        print(f"    {t['skipped']} excluded by icp.exclude_patterns")
+        print(f"    {t['principals']} principals stored as contacts")
+        if t["errors"]:
+            print(f"    {len(t['errors'])} state(s) failed:")
+            for e in t["errors"][:5]:
+                print(f"      ! {e}")
+        print()
+        print("  CBSE publishes no emails. Next (also free): harvey contacts")
+        print()
+
+    asyncio.run(_run())
+
+
+def cmd_contacts(args):
+    """Extract published contact addresses from company websites.
+
+    Free and deterministic: no model calls, no search API, no verification
+    credits. Every address stored is one the site publishes.
+    """
+    from harvey.state import StateManager
+    from harvey.config import load_config
+    from harvey.collectors.contacts import ContactExtractor
+
+    async def _contacts():
+        state = StateManager()
+        await state.init_db()
+        config = load_config()
+
+        sql = ("SELECT c.id, c.name, c.domain, c.phone, c.industry "
+               "FROM companies c WHERE c.domain != ''")
+        params: list = []
+        if not args.redo:
+            # Resumability: a company that already has contacts is skipped,
+            # so an interrupted run picks up exactly where it stopped.
+            sql += (" AND NOT EXISTS (SELECT 1 FROM prospects p "
+                    "WHERE p.company_id = c.id)")
+        if args.location:
+            sql += " AND UPPER(c.location) LIKE ?"
+            params.append(f"%{args.location.upper()}%")
+        sql += " ORDER BY c.created_at"
+        if args.limit:
+            sql += f" LIMIT {int(args.limit)}"
+
+        import aiosqlite
+        async with aiosqlite.connect(state.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cur:
+                companies = [dict(r) for r in await cur.fetchall()]
+
+        if not companies:
+            print("\n  No companies with a website need a contacts pass.\n")
+            return
+
+        print(f"\n  Reading {len(companies)} sites in batches of "
+              f"{args.batch} (free — no Claude, no search API)...\n")
+        if args.insecure:
+            print("  --insecure: expired/self-signed certificates accepted "
+                  "for this read-only pass.\n")
+        extractor = ContactExtractor(state, config,
+                                     concurrency=args.concurrency,
+                                     insecure=args.insecure)
+        t = await extractor.run(companies, batch_size=args.batch)
+        print(f"  CONTACTS — {t['companies']} sites read")
+        print(f"    {t['with_email']} schools with at least one email")
+        print(f"    {t['emails']} addresses found "
+              f"({t['named']} named, {t['generic']} generic)")
+        print(f"    {t['free_mail']} of those are free-mail "
+              f"(gmail/yahoo/rediffmail/outlook)")
+        print(f"    {t['phone_only']} phone only, {t['neither']} neither")
+        print(f"    {t['added']} contacts stored")
+        print("\n  Review: harvey dashboard -> Contacts, "
+              "or harvey export --all\n")
+
+    asyncio.run(_contacts())
+
+
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
-    from harvey.config import load_config
+    from harvey.config import load_config, load_env
     from harvey.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
+        PROVIDERS, build_queries, build_locality_queries, drop_saturated,
+        provider_menu, run_discovery,
     )
 
     async def _discover():
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            # provider_menu() needs the env to report readiness; without
+            # it every keyed provider reads "needs setup" even when its key
+            # is sitting in .env.
+            for m in provider_menu(load_env().model_dump()):
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -561,15 +674,43 @@ def cmd_discover(args):
 
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
-        queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
+        has_localities = bool(getattr(config.icp, "localities", {}))
+        use_localities = (args.localities
+                          or (has_localities and not args.no_localities))
+        if use_localities:
+            queries = build_locality_queries(
+                config, cities=cities, depth=min(args.depth, 10),
+                limit=args.limit)
+        else:
+            queries = build_queries(config, cities=cities,
+                                    depth=args.depth, limit=args.limit)
+
+        # A locality already mined is not worth another credit.
+        queries, skipped = await drop_saturated(state, config, queries)
+        if skipped:
+            print()
+            print(f"  Skipping {len(skipped)} saturated "
+                  f"{'locality' if len(skipped) == 1 else 'localities'} "
+                  f"(already at icp.locality_saturated_at)")
+            for label in skipped[:5]:
+                print(f"    - {label}")
+            if len(skipped) > 5:
+                print(f"    ... and {len(skipped) - 5} more")
+
+        if args.max_queries and len(queries) > args.max_queries:
+            print()
+            print(f"  Capping {len(queries)} queries to "
+                  f"{args.max_queries} (--max-queries)")
+            queries = queries[:args.max_queries]
 
         report = await run_discovery(state, config, args.provider, queries,
                                      max_spend=args.max_spend, dry_run=True)
         print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
+        wants_coords = PROVIDERS[args.provider].wants_coordinates()
         for q in queries[:8]:
-            print(f"    - {q.keyword()}" + ("" if q.coordinate else
-                  "   (no coordinates — add icp.geo_coordinates for radius search)"))
+            note = ("" if q.coordinate or not wants_coords else
+                    "   (no coordinates — add icp.geo_coordinates for radius search)")
+            print(f"    - {q.keyword()}{note}")
         if len(queries) > 8:
             print(f"    ... and {len(queries) - 8} more")
         print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
@@ -585,6 +726,7 @@ def cmd_discover(args):
         result = await run_prospecting(
             state, config, args.provider, queries,
             max_spend=args.max_spend, profile=not args.no_profile,
+            require_website=args.require_website,
         )
         r = result.discover or {}
         print(f"  DISCOVER — {r.get('found', 0)} results across "
@@ -592,6 +734,8 @@ def cmd_discover(args):
         print(f"    {r.get('new_companies', 0)} new companies, "
               f"{r.get('known_companies', 0)} already known")
         print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
+        print(f"    {r.get('excluded', 0)} excluded by icp.exclude_patterns")
+        print(f"    {r.get('no_website', 0)} dropped for having no website")
         print(f"    {r.get('observations', 0)} observations recorded")
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
         if r.get("stopped"):
@@ -898,6 +1042,15 @@ def main():
                      help="SERP depth (default: 30 — depth 100 costs 10x since Sept 2025)")
     sub.add_argument("--limit", type=int, default=100,
                      help="Max records per query (default: 100)")
+    sub.add_argument("--localities", action="store_true",
+                     help="One query per neighbourhood from icp.localities "
+                          "(default when localities are configured)")
+    sub.add_argument("--no-localities", action="store_true",
+                     help="Force one query per (industry x city) instead")
+    sub.add_argument("--require-website", action="store_true",
+                     help="Drop results with no website — nothing to profile")
+    sub.add_argument("--max-queries", type=int, default=0,
+                     help="Cap the query count, for a small paid trial")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
     sub.add_argument("--no-profile", action="store_true",
@@ -911,6 +1064,39 @@ def main():
     sub.add_argument("--stale-days", type=int, default=90,
                      help="Re-read a site after this many days (default: 90)")
     sub.set_defaults(func=cmd_profile)
+
+    sub = subparsers.add_parser(
+        "contacts", help="Extract published emails from company websites "
+                         "(free: no Claude, no search API)")
+    sub.add_argument("--limit", type=int, default=0,
+                     help="Max companies to read (default: all with a domain)")
+    sub.add_argument("--batch", type=int, default=25,
+                     help="Companies per batch (default: 25 — keeps memory flat)")
+    sub.add_argument("--concurrency", type=int, default=4,
+                     help="Parallel fetches within a batch (default: 4)")
+    sub.add_argument("--redo", action="store_true",
+                     help="Include companies that already have contacts")
+    sub.add_argument("--insecure", action="store_true",
+                     help="Accept expired/self-signed certificates. Only for "
+                          "reading public contact pages — never for sending")
+    sub.add_argument("--location", default="",
+                     help="Only companies whose stored location matches this "
+                          "(SQL LIKE, e.g. KARNATAKA). Lets a big import be "
+                          "worked through state by state, resumably.")
+    sub.set_defaults(func=cmd_contacts)
+
+    sub = subparsers.add_parser(
+        "import-cbse", help="Import the CBSE affiliated-schools directory "
+                            "(free; India + overseas)")
+    sub.add_argument("--states", default="",
+                     help="Semicolon-separated state names as SARAS spells "
+                          "them, e.g. 'KARNATAKA;FOREIGN SCHOOLS'. "
+                          "Default: every state.")
+    sub.add_argument("--interval", type=float, default=3.0,
+                     help="Seconds between requests (default: 3.0)")
+    sub.add_argument("--dry-run", action="store_true",
+                     help="List the states that would be fetched, then exit")
+    sub.set_defaults(func=cmd_import_cbse)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")

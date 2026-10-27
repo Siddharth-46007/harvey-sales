@@ -68,6 +68,20 @@ class ICPConfig(BaseModel):
     #   "Denver, CO": "39.7392,-104.9903,50"
     # Without one, listings providers can only match on the business name.
     geo_coordinates: dict[str, str] = {}
+    # Neighbourhoods to search inside each city, keyed by the `geography`
+    # entry. A city-wide query returns the same famous names over and over;
+    # one query per locality is how you reach the long tail. Empty = fall
+    # back to one query per (industry x city).
+    localities: dict[str, list[str]] = {}
+    # Regexes that disqualify a discovered business, matched against its
+    # name and domain. This is ICP-specific exclusion ("coaching centre",
+    # "govt school") and belongs in config, not in the collector — the
+    # collector's own junk filter only removes things that are never a
+    # business at all (directories, aggregators, social profiles).
+    exclude_patterns: list[str] = []
+    # Don't spend a query on a locality that already has this many companies
+    # on file — it has been mined. 0 disables the skip.
+    locality_saturated_at: int = 0
 
 
 class WarmupConfig(BaseModel):

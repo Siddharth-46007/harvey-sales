@@ -1447,6 +1447,24 @@ class StateManager:
             async with db.execute(sql, page_params) as cursor:
                 return size, [dict(row) for row in await cursor.fetchall()]
 
+    async def count_companies_at(self, location: str) -> int:
+        """How many companies are already on file for a locality label.
+
+        Used by discovery to skip a neighbourhood it has already mined.
+        Matches on the stored ``location`` prefix, so "Indiranagar,
+        Bengaluru, India" counts rows saved under that exact label without
+        also counting the rest of Bengaluru.
+        """
+        if not location:
+            return 0
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM companies WHERE location = ?",
+                (location,),
+            ) as cur:
+                row = await cur.fetchone()
+                return int(row[0]) if row else 0
+
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
     ) -> list[dict]:

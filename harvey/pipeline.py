@@ -88,6 +88,7 @@ async def run_prospecting(
     profile: bool = True,
     profile_limit: int = 200,
     dry_run: bool = False,
+    require_website: bool = False,
 ) -> PipelineReport:
     """Discover businesses, then read what their websites say about them.
 
@@ -102,6 +103,7 @@ async def run_prospecting(
     discovery = await run_discovery(
         state, config, provider or DEFAULT_PROVIDER, queries,
         max_spend=max_spend, dry_run=dry_run,
+        require_website=require_website,
     )
     report.discover = discovery.as_dict()
     report.errors.extend(discovery.errors)

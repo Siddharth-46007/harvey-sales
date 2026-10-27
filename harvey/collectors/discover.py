@@ -57,8 +57,9 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     # media & reference
     r"(^|\.)(wikipedia|reddit|quora|medium|substack|forbes|inc|entrepreneur)\.",
     r"(news|magazine|journal|gazette|tribune|herald)\.(com|org|net)$",
-    # institutional
-    r"\.(edu|gov|mil)$",
+    # institutional. .edu is handled separately in is_junk(): it is a US
+    # university TLD there, but an ordinary school domain elsewhere.
+    r"\.(gov|mil)$",
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
     # infrastructure that is never a prospect
@@ -215,9 +216,61 @@ def business_name(title: str, domain: str) -> str:
     return name_from_domain(domain) if stem else title
 
 
-def is_junk(domain: str, name: str = "") -> bool:
-    """True when this row would pollute the database rather than fill it."""
+def compile_excludes(patterns) -> tuple:
+    """Compile ``icp.exclude_patterns`` once per run.
+
+    A bad regex in config should disqualify that one pattern, not kill the
+    whole discovery run, so each is compiled independently and a broken one
+    is logged and dropped.
+    """
+    out = []
+    for pat in patterns or []:
+        try:
+            out.append(re.compile(pat, re.I))
+        except re.error as e:
+            logger.warning("discover: ignoring bad icp.exclude_patterns entry "
+                           "%r: %s", pat, e)
+    return tuple(out)
+
+
+def is_excluded(biz, excludes: tuple) -> bool:
+    """True when the ICP disqualifies this business.
+
+    Distinct from ``is_junk``: that removes rows which are never a business
+    (directories, social profiles). This removes real businesses we don't
+    sell to — a coaching centre, a government school — and which one is
+    which is the user's call, not the collector's.
+    """
+    if not excludes:
+        return False
+    haystack = " ".join(filter(None, (
+        biz.raw_title or biz.name, biz.domain, biz.category, biz.address,
+    )))
+    return any(p.search(haystack) for p in excludes)
+
+
+# A ".edu" is a US university and never a prospect; outside the US the same
+# TLD is just a school's domain. Only the US reading should filter, so the
+# rule needs to know where the result is. US state suffixes ("Denver, CO")
+# and the spelled-out country are the signals we have.
+US_LOCATION = re.compile(
+    r"(,\s*(US|U\.S\.|USA|United States)\b|,\s*[A-Z]{2}\s*(\d{5})?\s*$)")
+EDU_TLD = re.compile(r"\.edu$", re.I)
+
+
+def looks_us(location: str) -> bool:
+    return bool(location and US_LOCATION.search(location.strip()))
+
+
+def is_junk(domain: str, name: str = "", location: str = "") -> bool:
+    """True when this row would pollute the database rather than fill it.
+
+    ``location`` is optional and only narrows the .edu rule: with no
+    location we keep the original, stricter behaviour.
+    """
     if domain:
+        if EDU_TLD.search(domain) and (not location or looks_us(location)):
+            return True
         if any(p.search(domain) for p in JUNK_DOMAIN_PATTERNS):
             return True
         # A bare TLD or an IP address is never a business we can profile.
@@ -362,6 +415,17 @@ class DiscoveryProvider:
     signup_url: str = ""
     env_keys: tuple[str, ...] = ()
     caveat: str = ""
+    # Whether this provider searches a radius and so needs lat/lng. None
+    # means "infer from kind", which keeps the original behaviour: every
+    # listings provider geocodes. A provider that takes a text query (the
+    # map pack) sets this False, or it pays a Nominatim lookup per query
+    # at 1 req/s for a coordinate it never sends.
+    needs_coordinates: bool | None = None
+
+    def wants_coordinates(self) -> bool:
+        if self.needs_coordinates is None:
+            return self.kind == "listings"
+        return self.needs_coordinates
 
     def configured(self, env: dict) -> bool:
         return all(env.get(k) for k in self.env_keys)
@@ -581,6 +645,78 @@ class Serper(DiscoveryProvider):
         return out
 
 
+class SerperPlaces(DiscoveryProvider):
+    """Serper's Google Places endpoint — the map pack, not the web results.
+
+    Web search for "schools in <place>" answers with the pages that rank for
+    that phrase: directories, listicles, news. Places answers with the
+    businesses Google has a map entry for, each already carrying address,
+    phone, rating and (often) website. For "who exists here" that is the
+    right question to ask, and it costs the same single credit.
+
+    One page, ten results, no pagination: depth beyond the first page of a
+    map pack is mostly the next town over.
+    """
+
+    key = "serper_places"
+    label = "Serper Places (Google Maps)"
+    kind = "listings"
+    # Places resolves "schools in Al Barsha, Dubai" itself; a coordinate
+    # would be 94 Nominatim lookups for a field we never send.
+    needs_coordinates = False
+    blurb = ("Google's map pack via Serper. Returns real businesses with "
+             "address, phone, rating and website — not search results about "
+             "them. Best per-credit yield for local discovery.")
+    cost_note = "1 credit per query (<=10 results); ~$0.001 at the $1/1k tier"
+    free_tier = "shares Serper's 2,500 free queries, no card required"
+    signup_url = "https://serper.dev"
+    env_keys = ("serper_api_key",)
+    caveat = ("Serper does not publish a per-endpoint credit price; the "
+              "<=10-results rule is 1 credit. Verified against the live "
+              "balance on the first run.")
+
+    def estimate(self, queries):
+        # One page, <=10 results = 1 credit each.
+        return 0.001 * len(queries)
+
+    async def fetch(self, client, env, query):
+        r = await client.post(
+            "https://google.serper.dev/places",
+            headers={"X-API-KEY": env["serper_api_key"],
+                     "Content-Type": "application/json"},
+            json={"q": query.keyword(), "num": min(query.depth, 10), "page": 1},
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Serper reports what the call actually cost, so the run reports
+        # real spend instead of the estimate.
+        self.last_cost = 0.001 * float(data.get("credits") or 1)
+        out = []
+        for item in data.get("places") or []:
+            website = item.get("website") or ""
+            domain = normalize_domain(website)
+            cid = str(item.get("cid") or item.get("placeId") or "")
+            if not domain and not cid:
+                continue
+            out.append(Business(
+                name=item.get("title") or "",
+                raw_title=item.get("title") or "",
+                domain=domain,
+                website=website,
+                phone=item.get("phoneNumber") or "",
+                address=item.get("address") or "",
+                location=query.location,
+                category=item.get("category") or item.get("type") or "",
+                rating=item.get("rating"),
+                review_count=item.get("ratingCount") or item.get("reviews"),
+                has_website=bool(domain),
+                external_id=f"{self.key}:{cid}" if cid else "",
+                source_url=website,
+                provider=self.key,
+            ))
+        return out
+
+
 class OpenStreetMap(DiscoveryProvider):
     """Genuinely free, no account, no key. Honest about what that costs you.
 
@@ -725,6 +861,7 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
         DataForSEOListings(),
         DataForSEOSerp(),
         Serper(),
+        SerperPlaces(),
     )
 }
 
@@ -768,6 +905,10 @@ class DiscoveryReport:
     actual_cost: float = 0.0
     found: int = 0
     junk: int = 0
+    excluded: int = 0          # real businesses the ICP disqualifies
+    no_website: int = 0        # dropped for having no site to profile
+    phone_only: int = 0        # kept with no website: phone/address only
+    skipped_localities: list[str] = field(default_factory=list)
     new_companies: int = 0
     known_companies: int = 0
     observations: int = 0
@@ -781,6 +922,9 @@ class DiscoveryReport:
             "estimated_cost": round(self.estimated_cost, 4),
             "actual_cost": round(self.actual_cost, 4),
             "found": self.found, "junk": self.junk,
+            "excluded": self.excluded, "no_website": self.no_website,
+            "phone_only": self.phone_only,
+            "skipped_localities": self.skipped_localities,
             "new_companies": self.new_companies,
             "known_companies": self.known_companies,
             "observations": self.observations,
@@ -810,6 +954,54 @@ def build_queries(config, cities: list[str] | None = None,
     ]
 
 
+def build_locality_queries(config, cities: list[str] | None = None,
+                           depth: int = 10, limit: int = 20,
+                           term: str = "schools in") -> list[DiscoveryQuery]:
+    """One query per neighbourhood, from ``icp.localities``.
+
+    A city-wide search returns the same two dozen famous names however many
+    times you ask it; the long tail only appears when you ask street by
+    street. ``location`` carries the full "<locality>, <city>" label so the
+    saturation check below (and ``companies.location``) can tell one
+    neighbourhood from another without a schema change.
+
+    Falls back to ``build_queries`` when no localities are configured.
+    """
+    icp = config.icp
+    localities = getattr(icp, "localities", {}) or {}
+    if not localities:
+        return build_queries(config, cities=cities, depth=depth, limit=limit)
+
+    places = cities if cities is not None else list(icp.geography)
+    return [
+        DiscoveryQuery(term=term, location=f"{hood}, {city}",
+                       depth=depth, limit=limit)
+        for city in places
+        for hood in localities.get(city, [])
+    ]
+
+
+async def drop_saturated(state, config, queries: list[DiscoveryQuery]
+                         ) -> tuple[list[DiscoveryQuery], list[str]]:
+    """Remove queries whose locality has already been mined.
+
+    A locality that already has ``icp.locality_saturated_at`` companies on
+    file will mostly return rows we have, and a credit spent re-finding a
+    known school buys nothing. Returns the queries worth running and the
+    labels of the ones skipped.
+    """
+    threshold = getattr(config.icp, "locality_saturated_at", 0) or 0
+    if threshold <= 0:
+        return queries, []
+    keep, skipped = [], []
+    for q in queries:
+        if await state.count_companies_at(q.location) >= threshold:
+            skipped.append(q.location)
+        else:
+            keep.append(q)
+    return keep, skipped
+
+
 def estimate_cost(provider_key: str, queries: list[DiscoveryQuery]) -> float:
     """Projected spend. Always call this before a run — and print it."""
     provider = PROVIDERS.get(provider_key)
@@ -823,6 +1015,7 @@ async def run_discovery(
     queries: list[DiscoveryQuery] | None = None,
     max_spend: float = 1.0,
     dry_run: bool = False,
+    require_website: bool = False,
 ) -> DiscoveryReport:
     """Discover businesses and record what was learned about them.
 
@@ -838,7 +1031,7 @@ async def run_discovery(
         raise ValueError(f"unknown discovery provider: {provider_key!r}")
 
     queries = queries or build_queries(config)
-    if provider.kind == "listings":
+    if provider.wants_coordinates():
         queries = await resolve_coordinates(state, queries)
     report = DiscoveryReport(provider=provider_key, queries=len(queries))
     report.estimated_cost = provider.estimate(queries)
@@ -847,6 +1040,7 @@ async def run_discovery(
         return report
 
     env = load_env().model_dump()
+    excludes = compile_excludes(getattr(config.icp, 'exclude_patterns', []))
     if not provider.configured(env):
         missing = ", ".join(k.upper() for k in provider.env_keys
                             if not env.get(k))
@@ -905,9 +1099,23 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
-                    if is_junk(biz.domain, biz.raw_title or biz.name):
+                    if is_junk(biz.domain, biz.raw_title or biz.name,
+                               biz.location or biz.address):
                         report.junk += 1
                         continue
+                    if is_excluded(biz, excludes):
+                        report.excluded += 1
+                        continue
+                    # No website means nothing to profile and no email to
+                    # resolve, so the row cannot become a prospect.
+                    if not biz.domain:
+                        # No site to profile, but a named school with a phone
+                        # number is still a prospect — keep it unless the
+                        # caller explicitly asked for websites only.
+                        if require_website:
+                            report.no_website += 1
+                            continue
+                        report.phone_only += 1
                     ident = biz.identity()
                     if not ident or ident in seen:
                         continue

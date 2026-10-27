@@ -249,7 +249,7 @@ function showTab(id, btn) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadProgress(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -1534,30 +1534,133 @@ async function sendingToggle(action) {
   loadOutbox();
 }
 
+// ── Shared filter plumbing ───────────────────────────────────────────
+// Both lists are server-paginated: a directory import puts thousands of
+// rows in the table, and "newest 200" silently hides the rest.
+
+let _ctPage = 1, _coPage = 1, _filtersLoaded = false;
+let _ctTimer = null, _coTimer = null;
+
+function val(id) {
+  const el = document.getElementById(id);
+  if (!el) return '';
+  return el.type === 'checkbox' ? (el.checked ? '1' : '') : (el.value || '');
+}
+
+function qs(pairs) {
+  const p = new URLSearchParams();
+  Object.keys(pairs).forEach(k => { if (pairs[k]) p.set(k, pairs[k]); });
+  return p.toString();
+}
+
+function fillSelect(id, rows, label) {
+  const el = document.getElementById(id);
+  if (!el || !rows) return;
+  const keep = el.value;
+  let html = '<option value="">' + label + '</option>';
+  rows.forEach(r => {
+    html += '<option value="' + escHtml(r.value) + '">' +
+      escHtml(r.value) + ' (' + r.n + ')</option>';
+  });
+  el.innerHTML = html;
+  if (keep) el.value = keep;
+}
+
+async function loadFilterOptions(force) {
+  if (_filtersLoaded && !force) return;
+  const f = await api('/api/contacts/filters');
+  if (!f) return;
+  _filtersLoaded = true;
+  fillSelect('ct-source', f.source, 'Any source');
+  fillSelect('ct-status', f.email_status, 'Any email status');
+  fillSelect('ct-country', f.country, 'Any country');
+  fillSelect('ct-state', f.state_region, 'Any state');
+  fillSelect('ct-city', f.city, 'Any city');
+  fillSelect('ct-board', f.board, 'Any board');
+  fillSelect('co-source', f.company_source, 'Any source');
+  fillSelect('co-country', f.country, 'Any country');
+  fillSelect('co-state', f.state_region, 'Any state');
+  fillSelect('co-city', f.city, 'Any city');
+  fillSelect('co-board', f.board, 'Any board');
+}
+
+function pager(target, data, fn) {
+  const el = document.getElementById(target);
+  if (!el) return;
+  if (!data || data.total === 0) { el.innerHTML = ''; return; }
+  const from = (data.page - 1) * data.per_page + 1;
+  const to = Math.min(data.total, data.page * data.per_page);
+  el.innerHTML =
+    '<span class="pager-count">' + from + '&ndash;' + to + ' of ' +
+      data.total.toLocaleString() + '</span>' +
+    '<button class="btn btn-secondary btn-sm"' +
+      (data.page <= 1 ? ' disabled' : '') + ' onclick="' + fn + '(1)">&laquo; First</button>' +
+    '<button class="btn btn-secondary btn-sm"' +
+      (data.page <= 1 ? ' disabled' : '') + ' onclick="' + fn + '(' + (data.page - 1) + ')">&lsaquo; Prev</button>' +
+    '<span class="pager-page">Page ' + data.page + ' of ' + data.pages + '</span>' +
+    '<button class="btn btn-secondary btn-sm"' +
+      (data.page >= data.pages ? ' disabled' : '') + ' onclick="' + fn + '(' + (data.page + 1) + ')">Next &rsaquo;</button>' +
+    '<button class="btn btn-secondary btn-sm"' +
+      (data.page >= data.pages ? ' disabled' : '') + ' onclick="' + fn + '(' + data.pages + ')">Last &raquo;</button>';
+}
+
+function companyQuery() {
+  return qs({
+    page: _coPage, per_page: val('co-per') || 50, sort: val('co-sort'),
+    source: val('co-source'), country: val('co-country'),
+    state_region: val('co-state'), city: val('co-city'),
+    board: val('co-board'), has_website: val('co-website'),
+    has_email: val('co-email'), has_phone: val('co-phone'),
+    profiled: val('co-profiled'), q: val('co-q'),
+  });
+}
+
+function reloadCompanies(page) { _coPage = page || 1; loadCompanies(); }
+function debounceCompanies() {
+  clearTimeout(_coTimer);
+  _coTimer = setTimeout(() => reloadCompanies(1), 300);
+}
+function clearCompanyFilters() {
+  ['co-q','co-source','co-country','co-state','co-city','co-board',
+   'co-website','co-email','co-phone','co-profiled'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  reloadCompanies(1);
+}
+
 async function loadCompanies() {
   companyDrill = false;
   const el = document.getElementById('companies-list');
-  const data = await api('/api/companies');
+  await loadFilterOptions();
+  const data = await api('/api/companies?' + companyQuery());
   if (!data) { el.innerHTML = offlineState(); return; }
-  _companies = data;
-  if (!data.length) {
-    el.innerHTML = emptyState('&#9906;', 'No companies yet',
-      'Harvey\'s Scout agent hasn\'t researched any companies. Finish <b>Setup</b>, then start Harvey from the <b>Controls</b> tab.');
+  const rows = data.rows || [];
+  _companies = rows;
+  if (!rows.length) {
+    el.innerHTML = emptyState('&#9906;', 'No companies match',
+      data.total === 0 && !val('co-q')
+        ? 'Harvey hasn\'t researched any companies yet. Run <b>harvey discover</b> or <b>harvey import-cbse</b>.'
+        : 'No companies match these filters. Try <b>Clear</b>.');
+    pager('co-pager', data, 'reloadCompanies');
     return;
   }
-  let html = '<div class="table-card"><table><thead><tr><th>Company</th><th>Domain</th><th>Industry</th><th>Size</th><th>Location</th><th>Contacts</th><th>Source</th><th>Added</th></tr></thead><tbody>';
-  data.forEach((c, i) => {
+  let html = '<div class="table-card"><table><thead><tr><th>Company</th><th>Domain</th><th>Board</th><th>City</th><th>State</th><th>Country</th><th>Phone</th><th>Contacts</th><th>Emails</th><th>Profiled</th><th>Source</th></tr></thead><tbody>';
+  rows.forEach((c, i) => {
     const website = c.website || (c.domain ? 'https://' + c.domain : '');
     const nameLink = safeHref(website)
       ? '<a href="' + safeHref(website) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' + escHtml(c.name) + '</a>'
       : escHtml(c.name);
     html += '<tr style="cursor:pointer" onclick="showCompanyContacts(' + i + ')">' +
-      '<td>' + nameLink + '</td><td class="muted">' + escHtml(c.domain) + '</td><td>' + escHtml(c.industry) + '</td>' +
-      '<td>' + escHtml(c.company_size) + '</td><td>' + escHtml(c.location) + '</td>' +
-      '<td>' + (c.contact_count || 0) + '</td><td class="muted">' + escHtml(c.source) + '</td>' +
-      '<td class="muted">' + formatDate(c.created_at) + '</td></tr>';
+      '<td>' + nameLink + '</td><td class="muted">' + escHtml(c.domain) + '</td>' +
+      '<td>' + escHtml(c.board) + '</td><td>' + escHtml(c.city) + '</td>' +
+      '<td>' + escHtml(c.state_region) + '</td><td>' + escHtml(c.country) + '</td>' +
+      '<td class="muted">' + escHtml(c.phone) + '</td>' +
+      '<td>' + (c.contact_count || 0) + '</td><td>' + (c.email_count || 0) + '</td>' +
+      '<td>' + (c.profile_checked_at ? '&#10003;' : '&mdash;') + '</td>' +
+      '<td class="muted">' + escHtml(c.source) + '</td></tr>';
   });
   el.innerHTML = html + '</tbody></table></div>';
+  pager('co-pager', data, 'reloadCompanies');
 }
 
 async function showCompanyContacts(index) {
@@ -1609,27 +1712,125 @@ function fbCampaign(i) {
   if (c) submitFeedback('campaign', c.id, 'What should Harvey do differently in the emails it writes next? (e.g. "shorter; don\'t mention reviews")');
 }
 
+function contactQuery() {
+  return qs({
+    page: _ctPage, per_page: val('ct-per') || 50, sort: val('ct-sort'),
+    source: val('ct-source'), email_status: val('ct-status'),
+    has_email: val('ct-hasemail'), primary_only: val('ct-primary'),
+    country: val('ct-country'), state_region: val('ct-state'),
+    city: val('ct-city'), board: val('ct-board'), q: val('ct-q'),
+  });
+}
+
+function reloadProspects(page) { _ctPage = page || 1; loadProspects(); }
+function debounceProspects() {
+  clearTimeout(_ctTimer);
+  _ctTimer = setTimeout(() => reloadProspects(1), 300);
+}
+function clearContactFilters() {
+  ['ct-q','ct-source','ct-status','ct-hasemail','ct-country','ct-state',
+   'ct-city','ct-board'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const pri = document.getElementById('ct-primary');
+  if (pri) pri.checked = false;
+  reloadProspects(1);
+}
+
+// Exports exactly what the filters currently show, not the whole table —
+// the same filter string the view was built from.
+function exportFilteredContacts(btn) {
+  downloadCsv('/api/export/contacts.csv?' + contactQuery(), 'contacts.csv', btn);
+}
+
 async function loadProspects() {
   const el = document.getElementById('prospects-table');
-  const data = await api('/api/prospects');
+  await loadFilterOptions();
+  const data = await api('/api/prospects?' + contactQuery());
   if (!data) { el.innerHTML = offlineState(); return; }
-  _prospects = data;
-  if (!data.length) {
-    el.innerHTML = emptyState('&#9673;', 'No contacts yet',
-      'Harvey hasn\'t found any prospects. Once it\'s running, the Scout agent searches the web for people matching your ideal customer profile in <b>harvey.yaml</b>.');
+  const rows = data.rows || [];
+  _prospects = rows;
+  if (!rows.length) {
+    el.innerHTML = emptyState('&#9673;', 'No contacts match',
+      data.total === 0 && !val('ct-q')
+        ? 'Harvey hasn\'t found any contacts. Run <b>harvey import-cbse</b> for school names, then <b>harvey contacts</b> to pull published addresses.'
+        : 'No contacts match these filters. Try <b>Clear</b>.');
+    pager('ct-pager', data, 'reloadProspects');
     return;
   }
-  let html = '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
-  data.forEach((p, i) => {
+  let html = '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>School</th><th>City</th><th>State</th><th>Email</th><th>Phone</th><th>Board</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
+  rows.forEach((p, i) => {
     const emailV = p.email ? (escHtml(p.email) + emailTag(p)) : '';
     const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span class="verified">&#10003;</span>' : '')) : '';
-    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
+    const star = (p.score || 0) >= 100 ? ' <span class="verified" title="Primary contact">&#9733;</span>' : '';
+    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + star + '</td>' +
       '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +
-      '<td>' + emailV + '</td><td>' + phoneV + '</td><td>' + badge(p.status) + '</td>' +
+      '<td>' + escHtml(p.city) + '</td><td>' + escHtml(p.state_region) + '</td>' +
+      '<td>' + emailV + '</td><td>' + phoneV + '</td>' +
+      '<td>' + escHtml(p.board) + '</td>' +
       '<td class="muted">' + escHtml(p.source) + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
       '<td><button class="btn btn-secondary btn-sm" onclick="fbProspect(' + i + ')">Feedback</button></td></tr>';
   });
   el.innerHTML = html + '</tbody></table></div>';
+  pager('ct-pager', data, 'reloadProspects');
+}
+
+// ── Coverage panel (Today) ───────────────────────────────────────────
+// Answers "what is left to scrape?" — per region, how many schools have an
+// email and how many have never been through the extractor.
+
+async function loadProgress() {
+  const el = document.getElementById('progress-panel');
+  if (!el) return;
+  const d = await api('/api/progress');
+  if (!d) { el.innerHTML = '<p class="muted" style="font-size:13px">Offline.</p>'; return; }
+  const t = d.totals || {};
+  const n = v => (v || 0).toLocaleString();
+  let html = '<div class="cov-grid">' +
+    statCell('Schools', n(t.schools)) +
+    statCell('With email', n(t.with_email)) +
+    statCell('Phone only', n(t.phone_only)) +
+    statCell('Emails', n(t.emails)) +
+    statCell('Primary emails', n(t.primary_emails)) +
+    statCell('Principals named', n(t.principals_named)) +
+    '</div>' +
+    '<div class="cov-grid" style="margin-top:10px">' +
+    statCell('With a website', n(t.with_website)) +
+    statCell('With a phone', n(t.with_phone)) +
+    statCell('Sites read', n(t.extracted)) +
+    statCell('Still to read', n(t.extraction_pending)) +
+    '</div>';
+
+  const c = d.credits || {};
+  html += '<div class="cov-grid" style="margin-top:10px">' +
+    statCell('Serper credits used', n(c.used)) +
+    statCell('Credits left', n(c.remaining)) +
+    '</div>' +
+    '<p class="muted" style="font-size:11px;margin:6px 0 0">' +
+      escHtml(c.note || '') + '</p>';
+
+  const regions = d.by_region || [];
+  if (regions.length) {
+    html += '<div class="table-card" style="margin-top:14px"><table><thead><tr>' +
+      '<th>State / country</th><th>Schools</th><th>Website</th>' +
+      '<th>With email</th><th>Sites read</th><th>To read</th>' +
+      '</tr></thead><tbody>';
+    regions.forEach(r => {
+      html += '<tr><td>' + escHtml(r.region || '(unknown)') + '</td>' +
+        '<td>' + n(r.schools) + '</td><td>' + n(r.with_website) + '</td>' +
+        '<td>' + n(r.with_email) + '</td>' +
+        '<td>' + n(r.extracted) + '</td>' +
+        '<td' + (r.pending ? ' class="warn"' : ' class="muted"') + '>' +
+          n(r.pending) + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  el.innerHTML = html;
+}
+
+function statCell(label, value) {
+  return '<div class="cov-cell"><div class="cov-value">' + value +
+    '</div><div class="cov-label">' + escHtml(label) + '</div></div>';
 }
 
 // Opens a filled-in compose window in whatever Gmail account the browser is
@@ -1847,7 +2048,7 @@ setInterval(async () => {
 setInterval(() => {
   if (document.hidden || _locked) return;
   switch (currentTab) {
-    case 'today': loadToday(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadProgress(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;

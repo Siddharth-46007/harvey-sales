@@ -79,6 +79,10 @@
       <div id="live-status" style="margin-bottom:28px"></div>
       <div id="today-queue"></div>
       <div class="rail-block" style="margin-top:34px">
+        <div class="subhead">Coverage</div>
+        <div id="progress-panel"></div>
+      </div>
+      <div class="rail-block" style="margin-top:34px">
         <div class="subhead">Recent activity</div>
         <div id="today-activity"></div>
       </div>
@@ -162,19 +166,51 @@
 <!-- Companies -->
 <div id="companies" class="section">
   <div class="section-head"><h2>Companies</h2><p>Organizations Harvey has researched. Click a row to see its contacts.</p></div>
+  <div class="filter-bar" id="co-filters">
+    <input class="filter-search" id="co-q" type="search" placeholder="Search name, domain or location&hellip;" oninput="debounceCompanies()">
+    <select id="co-source" onchange="reloadCompanies()"><option value="">Any source</option></select>
+    <select id="co-country" onchange="reloadCompanies()"><option value="">Any country</option></select>
+    <select id="co-state" onchange="reloadCompanies()"><option value="">Any state</option></select>
+    <select id="co-city" onchange="reloadCompanies()"><option value="">Any city</option></select>
+    <select id="co-board" onchange="reloadCompanies()"><option value="">Any board</option></select>
+    <select id="co-website" onchange="reloadCompanies()"><option value="">Website: any</option><option value="yes">Has website</option><option value="no">No website</option></select>
+    <select id="co-email" onchange="reloadCompanies()"><option value="">Email: any</option><option value="yes">Has email</option><option value="no">No email</option></select>
+    <select id="co-phone" onchange="reloadCompanies()"><option value="">Phone: any</option><option value="yes">Has phone</option><option value="no">No phone</option></select>
+    <select id="co-profiled" onchange="reloadCompanies()"><option value="">Profiled: any</option><option value="yes">Profiled</option><option value="no">Not profiled</option></select>
+    <select id="co-sort" onchange="reloadCompanies()"><option value="added">Newest</option><option value="school">Name A&ndash;Z</option><option value="city">City</option><option value="contacts">Most contacts</option></select>
+    <select id="co-per" onchange="reloadCompanies()"><option value="50">50 / page</option><option value="100">100 / page</option></select>
+    <button class="btn btn-secondary btn-sm" onclick="clearCompanyFilters()">Clear</button>
+  </div>
   <div id="companies-list"></div>
+  <div class="pager" id="co-pager"></div>
 </div>
 
 <!-- Contacts -->
 <div id="prospects" class="section">
   <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
-    <div><h2>Contacts</h2><p>People Harvey has found and verified.</p></div>
+    <div><h2>Contacts</h2><p>People and mailboxes Harvey has found.</p></div>
     <div style="display:flex;gap:8px;flex-shrink:0">
-      <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv', 'prospects.csv', this)">Export deliverable CSV</button>
-      <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv?all=true', 'prospects-all.csv', this)">Export all</button>
+      <button class="btn btn-primary btn-sm" id="ct-export" onclick="exportFilteredContacts(this)">Export this view</button>
+      <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv', 'prospects.csv', this)">Deliverable CSV</button>
+      <button class="btn btn-secondary btn-sm" onclick="downloadCsv('/api/export/prospects.csv?all=true', 'prospects-all.csv', this)">All</button>
     </div>
   </div>
+  <div class="filter-bar" id="ct-filters">
+    <input class="filter-search" id="ct-q" type="search" placeholder="Search school, email or principal&hellip;" oninput="debounceProspects()">
+    <select id="ct-source" onchange="reloadProspects()"><option value="">Any source</option></select>
+    <select id="ct-status" onchange="reloadProspects()"><option value="">Any email status</option></select>
+    <select id="ct-hasemail" onchange="reloadProspects()"><option value="">Email: any</option><option value="yes">Has email</option><option value="no">No email</option></select>
+    <select id="ct-country" onchange="reloadProspects()"><option value="">Any country</option></select>
+    <select id="ct-state" onchange="reloadProspects()"><option value="">Any state</option></select>
+    <select id="ct-city" onchange="reloadProspects()"><option value="">Any city</option></select>
+    <select id="ct-board" onchange="reloadProspects()"><option value="">Any board</option></select>
+    <select id="ct-sort" onchange="reloadProspects()"><option value="added">Newest</option><option value="school">School A&ndash;Z</option><option value="city">City</option><option value="score">Primary first</option></select>
+    <select id="ct-per" onchange="reloadProspects()"><option value="50">50 / page</option><option value="100">100 / page</option></select>
+    <label class="filter-check"><input type="checkbox" id="ct-primary" onchange="reloadProspects()"> Primary only</label>
+    <button class="btn btn-secondary btn-sm" onclick="clearContactFilters()">Clear</button>
+  </div>
   <div id="prospects-table"></div>
+  <div class="pager" id="ct-pager"></div>
 </div>
 
 <!-- Campaigns -->

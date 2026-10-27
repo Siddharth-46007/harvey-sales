@@ -45,8 +45,44 @@ PAGE_GROUPS = (
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 MAILTO_RE = re.compile(r"mailto:([^\"'?>\s]+)", re.I)
 TEL_RE = re.compile(r"tel:([+0-9()\-.\s]{7,})", re.I)
-# A phone number needs either a + country code or enough digits to be one.
-PHONE_CAND_RE = re.compile(r"(?:\+\d{1,3}[\s\-.]?)?(?:\(?\d{2,5}\)?[\s\-.]?){1,3}\d{3,5}")
+
+# ── Phone numbers written as plain text ─────────────────────────────
+#
+# Most school sites print the number in a footer or a "Contact Us" block
+# and never wrap it in a tel: link, so tel: alone finds a minority of them.
+# Reading the visible text finds the rest — at the price of having to tell a
+# phone number apart from an affiliation number, a pincode, a year range and
+# a bank account, all of which also appear in school footers. Hence: a
+# candidate must not touch another digit, must survive a length-and-shape
+# check, and must not be introduced by a label that names something else.
+
+# Script and style hold ids, versions and timestamps that look like numbers.
+_SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1>", re.I | re.S)
+_TAG_RE = re.compile(r"<[^>]+>")
+_ENTITY = (("&nbsp;", " "), ("&amp;", "&"), ("&#43;", "+"), ("&plus;", "+"),
+           ("&#x2b;", "+"), ("&ndash;", "-"), ("&mdash;", "-"),
+           ("&#8211;", "-"), ("&#8212;", "-"), ("&lt;", "<"), ("&gt;", ">"))
+
+# A run of digits, spaces, dashes, dots, slashes and brackets, optionally led
+# by a +. (?<![\d+]) / (?![\d]) keep it from biting a piece out of a longer
+# number. Separators are allowed inside but the run must end on a digit.
+PHONE_TEXT_RE = re.compile(
+    r"(?<![\d+])(\+?\d[\d\s().\-/]{7,20}\d)(?!\d)")
+
+# Labels that introduce a number which is definitely not a phone. School
+# footers are full of these, and a wrong phone is worse than none.
+PHONE_NOT_LABEL_RE = re.compile(
+    r"\b(affiliation|affl|school\s*code|udise|dise|gstin|gst|cin|pan|tan|"
+    r"ifsc|account|a/?c|registration|pin\s*code|pincode|zip|estd|"
+    r"established|since|fees?|amount|rs|inr|invoice|receipt|roll|"
+    r"aadha?ar|passport|licen[cs]e|certificate|order)"
+    # The label is usually followed by the word that introduces the number:
+    # "Affiliation No.", "UDISE Code:", "Account Number".
+    r"(?:\s*(?:no|nos|number|code|id|#)\b)?"
+    r"[^A-Za-z0-9]{0,12}$", re.I)
+
+# Indian mobile numbers start 6-9; a 10-digit number starting 0-5 is not one.
+_IN_MOBILE = re.compile(r"^[6-9]\d{9}$")
 
 # An address ending in an asset extension came out of a filename, not a
 # footer: "logo@2x.png", "sprite@main.svg".
@@ -259,6 +295,97 @@ def clean_phone(raw: str) -> str:
     return ("+" + digits) if s.lstrip().startswith("+") else digits
 
 
+def normalise_phone(raw: str, default_cc: str = "91") -> str:
+    """A plain-text candidate as a dialable number, else "".
+
+    Stricter than :func:`clean_phone`, which trusts a ``tel:`` link to hold a
+    phone number. Here the candidate came out of running text, so the shape
+    has to carry the proof.
+    """
+    s = (raw or "").strip()
+    plus = s.startswith("+")
+    digits = re.sub(r"\D", "", s)
+
+    # A run of years ("2024202520262027") is a calendar, not a number, and
+    # must be rejected whole — truncating it first would hide the pattern.
+    if re.fullmatch(r"(19|20)\d{2}((19|20)\d{2})+", digits):
+        return ""
+
+    # Two numbers printed as one run: "9845012345 9900112233". Take the
+    # first one rather than gluing them into nonsense. A 10-digit Indian
+    # mobile is by far the likeliest boundary, so try that width first.
+    if len(digits) > 15:
+        # With a leading +, the country code sets the length and guessing a
+        # boundary would invent a number. Two + numbers run together are
+        # dropped rather than mangled.
+        if plus:
+            return ""
+        for width in (10, 11, 12):
+            head = digits[:width]
+            if _IN_MOBILE.match(head) or (
+                    width == 10 and _plausible(head)):
+                digits = head
+                break
+        else:
+            return ""
+
+    if not _plausible(digits):
+        return ""
+
+    if plus:
+        return "+" + digits
+    if _IN_MOBILE.match(digits):                       # 9845012345
+        return "+" + default_cc + digits
+    if len(digits) == 11 and digits[0] == "0" and _IN_MOBILE.match(digits[1:]):
+        return "+" + default_cc + digits[1:]           # 09845012345
+    if len(digits) == 12 and digits.startswith(default_cc) \
+            and _IN_MOBILE.match(digits[2:]):
+        return "+" + digits                            # 919845012345
+    # An Indian landline with its STD code, or a number we can't place.
+    # Kept verbatim: dialable locally, and honest about not knowing more.
+    return digits
+
+
+def _plausible(digits: str) -> bool:
+    """Shape checks every phone number has to pass."""
+    if not 10 <= len(digits) <= 15:
+        return False
+    if len(set(digits)) <= 3:                 # 0000000000, 1212121212
+        return False
+    if digits in "01234567890123456789" or digits in "98765432109876543210":
+        return False
+    return True
+
+
+def _visible_text(html: str) -> str:
+    """The page's readable text, with script, style and tags removed."""
+    s = _SCRIPT_RE.sub(" ", html or "")
+    s = _TAG_RE.sub(" ", s)
+    for ent, ch in _ENTITY:
+        s = s.replace(ent, ch)
+    s = re.sub(r"&#\d{2,5};", " ", s)
+    return re.sub(r"[ \t ]+", " ", s)
+
+
+def extract_text_phones(html: str, limit: int = 12) -> list[str]:
+    """Phone numbers printed as text on the page, best-first and deduped."""
+    text = _visible_text(html)
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in PHONE_TEXT_RE.finditer(text):
+        # What comes immediately before decides whether this is a phone at
+        # all: "Affiliation No. 830221" is not one.
+        if PHONE_NOT_LABEL_RE.search(text[max(0, m.start() - 40):m.start()]):
+            continue
+        phone = normalise_phone(m.group(1))
+        if phone and phone not in seen:
+            seen.add(phone)
+            out.append(phone)
+            if len(out) >= limit:
+                break
+    return out
+
+
 def is_generic(email: str) -> bool:
     """True when the address is a role mailbox rather than a person."""
     local = email.partition("@")[0]
@@ -355,18 +482,34 @@ class ContactExtractor:
         return out
 
     @staticmethod
-    def _harvest(html: str) -> tuple[set[str], set[str]]:
-        """Every address and phone number on one page."""
-        emails, phones = set(), set()
+    def _harvest(html: str) -> tuple[set[str], list[str]]:
+        """Every address and phone number on one page.
+
+        Phones come back in page order — a tel: link first, then the
+        numbers printed as text — because the first one is the one the site
+        leads with, and that is the one worth storing on the school.
+        """
+        emails: set[str] = set()
+        phones: list[str] = []
         for raw in MAILTO_RE.findall(html):
             if (e := clean_email(raw)):
                 emails.add(e)
         for raw in EMAIL_RE.findall(html):
             if (e := clean_email(raw)):
                 emails.add(e)
+        # A tel: link is the site's own assertion that this is its number,
+        # so it outranks anything found by reading the text.
         for raw in TEL_RE.findall(html):
-            if (p := clean_phone(raw)):
-                phones.add(p)
+            # Normalised the same way as a text phone, so "9845012345" in a
+            # tel: link and "+91 98450 12345" in the footer dedupe to one
+            # number. clean_phone catches the short local forms that the
+            # stricter normaliser refuses.
+            p = normalise_phone(raw) or clean_phone(raw)
+            if p and p not in phones:
+                phones.append(p)
+        for p in extract_text_phones(html):
+            if p not in phones:
+                phones.append(p)
         return emails, phones
 
     async def _people_for(self, company_id: str
@@ -393,22 +536,34 @@ class ContactExtractor:
         """Extract and store contacts for one company."""
         domain = (company.get("domain") or "").strip()
         result = {"domain": domain, "emails": 0, "named": 0, "generic": 0,
-                  "phones": 0, "added": 0, "free_mail": 0,
+                  "phones": 0, "phone_stored": 0, "added": 0, "free_mail": 0,
                   "group_related": 0, "primary": 0,
                   "dropped_foreign": 0, "dropped_unrelated": 0}
         if not domain:
             return result
 
         emails: dict[str, str] = {}      # email -> evidence url
-        phones: dict[str, str] = {}
+        phones: list[str] = []           # page order: the lead number first
         for url, html in await self._pages(client, domain):
             page_emails, page_phones = self._harvest(html)
             for e in page_emails:
                 emails.setdefault(e, url)
             for p in page_phones:
-                phones.setdefault(p, url)
+                if p not in phones:
+                    phones.append(p)
 
         result["phones"] = len(phones)
+        had_phone = bool((company.get("phone") or "").strip())
+        # Mark the attempt whatever it found, and give the school the number
+        # if it had none — a phone-only school is still a sales lead.
+        try:
+            await self.state.mark_contacts_extracted(
+                company["id"], phones[0] if phones else "")
+            if phones and not had_phone:
+                result["phone_stored"] = 1
+        except Exception as e:
+            logger.warning("contacts: could not mark %s: %s", domain, e)
+
         if not emails:
             return result
 
@@ -432,7 +587,7 @@ class ContactExtractor:
         primary = choose_primary(list(classed.items()))
         people = await self._people_for(company["id"])
         fallback_phone = (company.get("phone") or "").strip() or (
-            next(iter(phones), "") if phones else "")
+            phones[0] if phones else "")
 
         for email, evidence in sorted(emails.items()):
             person = match_person(email, people)
@@ -498,8 +653,8 @@ class ContactExtractor:
         totals = {"companies": 0, "with_email": 0, "emails": 0, "named": 0,
                   "generic": 0, "phone_only": 0, "neither": 0, "added": 0,
                   "free_mail": 0, "group_related": 0,
-                  "primary": 0, "dropped_foreign": 0,
-                  "dropped_unrelated": 0}
+                  "primary": 0, "phones_found": 0, "phones_stored": 0,
+                  "dropped_foreign": 0, "dropped_unrelated": 0}
         sem = asyncio.Semaphore(self.concurrency)
 
         async def one(client, c):
@@ -528,6 +683,8 @@ class ContactExtractor:
                 for k in ("free_mail", "group_related", "primary",
                           "dropped_foreign", "dropped_unrelated"):
                     totals[k] += r[k]
+                totals["phones_found"] += r["phones"]
+                totals["phones_stored"] += r["phone_stored"]
                 if r["emails"]:
                     totals["with_email"] += 1
                 elif r["phones"] or (c.get("phone") or "").strip():

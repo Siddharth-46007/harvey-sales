@@ -431,15 +431,211 @@ async def test_instantly(request: Request):
 # ── Companies ──
 
 
+def _company_filters(source: str, country: str, state_region: str, city: str,
+                      board: str, has_website: str, has_email: str,
+                      has_phone: str, profiled: str, q: str
+                      ) -> tuple[str, list]:
+    where, params = [], []
+    if source:
+        where.append("c.source = ?"); params.append(source)
+    for col, val in (("c.country", country), ("c.state_region", state_region),
+                     ("c.city", city), ("c.board", board)):
+        if val:
+            where.append(f"{col} = ?"); params.append(val)
+    if has_website in ("yes", "no"):
+        where.append(f"c.domain {'!=' if has_website == 'yes' else '='} ''")
+    if has_phone in ("yes", "no"):
+        where.append(f"c.phone {'!=' if has_phone == 'yes' else '='} ''")
+    if has_email in ("yes", "no"):
+        exists = ("EXISTS" if has_email == "yes" else "NOT EXISTS")
+        where.append(f"{exists} (SELECT 1 FROM prospects p2 "
+                     f"WHERE p2.company_id = c.id AND p2.email != '')")
+    if profiled == "yes":
+        where.append("c.profile_checked_at IS NOT NULL")
+    elif profiled == "no":
+        where.append("c.profile_checked_at IS NULL")
+    if q:
+        where.append("(c.name LIKE ? OR c.domain LIKE ? OR c.location LIKE ?)")
+        params.extend([f"%{q}%"] * 3)
+    return (" WHERE " + " AND ".join(where) if where else ""), params
+
+
 @app.get("/api/companies")
-async def get_companies():
-    """All companies with contact counts."""
-    rows = await query_db("""
-        SELECT c.*,
-            (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
-        FROM companies c ORDER BY c.created_at DESC LIMIT 200
+async def get_companies(
+    page: int = 1, per_page: int = 50, sort: str = "added",
+    source: str = "", country: str = "", state_region: str = "",
+    city: str = "", board: str = "", has_website: str = "",
+    has_email: str = "", has_phone: str = "", profiled: str = "",
+    q: str = "",
+):
+    """One page of companies with contact counts."""
+    per_page = max(1, min(200, per_page))
+    page = max(1, page)
+    clause, params = _company_filters(source, country, state_region, city,
+                                      board, has_website, has_email,
+                                      has_phone, profiled, q)
+    order = _COMPANY_SORTS.get(sort, _COMPANY_SORTS["added"])
+
+    total_rows = await query_db(
+        f"SELECT COUNT(*) AS n FROM companies c{clause}", tuple(params))
+    total = total_rows[0]["n"] if total_rows else 0
+
+    rows = await query_db(
+        f"""SELECT c.*,
+                (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id)
+                    AS contact_count,
+                (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id
+                    AND p.email != '') AS email_count
+            FROM companies c {clause} ORDER BY {order} LIMIT ? OFFSET ?""",
+        tuple(params) + (per_page, (page - 1) * per_page))
+    return {"rows": rows, "total": total, "page": page,
+            "per_page": per_page, "pages": max(1, -(-total // per_page))}
+
+
+@app.get("/api/export/contacts.csv")
+async def export_contacts_filtered(
+    sort: str = "school", source: str = "", email_status: str = "",
+    has_email: str = "", primary_only: bool = False, country: str = "",
+    state_region: str = "", city: str = "", board: str = "", q: str = "",
+):
+    """CSV of exactly the filtered view on screen — no row cap.
+
+    Separate from /api/export/prospects.csv, which is the sequencer-shaped
+    export with its own deliverability rules. This one answers "give me what
+    I am looking at".
+    """
+    import csv
+    import io
+
+    clause, params = _contact_filters(
+        source, email_status, has_email, primary_only, country,
+        state_region, city, board, q)
+    order = _CONTACT_SORTS.get(sort, _CONTACT_SORTS["school"])
+    rows = await query_db(
+        f"""SELECT c.name AS school, c.city, c.state_region, c.country,
+                   c.board, c.website, COALESCE(NULLIF(p.phone,''), c.phone)
+                     AS phone, p.email, p.email_status, p.first_name,
+                   p.last_name, p.title, p.score, p.source, p.source_url,
+                   p.personalization_notes, p.created_at
+            FROM prospects p LEFT JOIN companies c ON c.id = p.company_id
+            {clause} ORDER BY {order}""", tuple(params))
+
+    buf = io.StringIO()
+    cols = ["school", "city", "state_region", "country", "board", "website",
+            "phone", "email", "email_status", "first_name", "last_name",
+            "title", "score", "source", "source_url",
+            "personalization_notes", "created_at"]
+    w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore",
+                       lineterminator="\n")
+    w.writeheader()
+    for r in rows:
+        w.writerow({k: (r.get(k) if r.get(k) is not None else "")
+                    for k in cols})
+    return PlainTextResponse(
+        buf.getvalue(), media_type="text/csv",
+        headers={"Content-Disposition":
+                 'attachment; filename="contacts-filtered.csv"'})
+
+
+@app.get("/api/progress")
+async def get_progress():
+    """Coverage of the pipeline: totals, per-region breakdown, credit spend."""
+    def one(rows, key="n", default=0):
+        return rows[0][key] if rows else default
+
+    totals = {
+        "schools": one(await query_db("SELECT COUNT(*) AS n FROM companies")),
+        "with_website": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies WHERE domain != ''")),
+        "with_email": one(await query_db(
+            "SELECT COUNT(DISTINCT company_id) AS n FROM prospects "
+            "WHERE email != ''")),
+        "phone_only": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies c WHERE c.phone != '' "
+            "AND NOT EXISTS (SELECT 1 FROM prospects p "
+            "WHERE p.company_id = c.id AND p.email != '')")),
+        "emails": one(await query_db(
+            "SELECT COUNT(*) AS n FROM prospects WHERE email != ''")),
+        "primary_emails": one(await query_db(
+            "SELECT COUNT(*) AS n FROM prospects WHERE score >= 100 "
+            "AND email != ''")),
+        "principals_named": one(await query_db(
+            "SELECT COUNT(*) AS n FROM prospects WHERE first_name != ''")),
+        "profiled": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies "
+            "WHERE profile_checked_at IS NOT NULL")),
+        "extracted": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies "
+            "WHERE contacts_checked_at IS NOT NULL")),
+        "extraction_pending": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies "
+            "WHERE domain != '' AND contacts_checked_at IS NULL")),
+        "with_phone": one(await query_db(
+            "SELECT COUNT(*) AS n FROM companies WHERE phone != ''")),
+    }
+
+    # "Extracted" means the contact extractor read that site, found or not —
+    # its own marker, not "has a prospect row", which the CBSE import sets
+    # for every school it stores a principal for. Only a school with a
+    # website can be pending: there is nothing to read without one.
+    by_region = await query_db("""
+        SELECT COALESCE(NULLIF(c.state_region,''),
+                        NULLIF(c.country,''), '(unknown)') AS region,
+               COUNT(*) AS schools,
+               SUM(CASE WHEN c.domain != '' THEN 1 ELSE 0 END) AS with_website,
+               SUM(CASE WHEN EXISTS (SELECT 1 FROM prospects p
+                     WHERE p.company_id = c.id AND p.email != '')
+                   THEN 1 ELSE 0 END) AS with_email,
+               SUM(CASE WHEN c.domain != ''
+                        AND c.contacts_checked_at IS NOT NULL
+                   THEN 1 ELSE 0 END) AS extracted
+        FROM companies c
+        GROUP BY region ORDER BY schools DESC
     """)
-    return rows
+    for r in by_region:
+        r["pending"] = max(0, (r.get("with_website") or 0)
+                           - (r.get("extracted") or 0))
+
+    by_source = await query_db(
+        "SELECT source, COUNT(*) AS n FROM companies "
+        "WHERE source != '' GROUP BY source ORDER BY n DESC")
+
+    return {"totals": totals, "by_region": by_region,
+            "by_source": by_source, "credits": await _serper_credits()}
+
+
+# Serper's free allowance. Spend is read from our own run log, never by
+# calling the API — a balance check would itself cost a request.
+SERPER_FREE_QUERIES = 2500
+
+
+# One Serper credit costs $0.001 at the entry tier, which is how the
+# collector records spend. Dividing back out recovers the credit count
+# without asking Serper for a balance (that request would itself cost one).
+SERPER_USD_PER_CREDIT = 0.001
+
+
+async def _serper_credits() -> dict:
+    """Credits used and remaining, from our own `runs` log. No API call."""
+    rows = await query_db(
+        "SELECT provider, COUNT(*) AS runs, "
+        "       SUM(COALESCE(records,0)) AS records, "
+        "       SUM(COALESCE(cost_usd,0)) AS usd "
+        "FROM runs WHERE provider LIKE 'serper%' GROUP BY provider")
+    spend = sum(float(r["usd"] or 0) for r in rows)
+    used = int(round(spend / SERPER_USD_PER_CREDIT)) if spend else 0
+    return {
+        "source": "local runs log (no API call)",
+        "free_allowance": SERPER_FREE_QUERIES,
+        "used": used,
+        "remaining": max(0, SERPER_FREE_QUERIES - used),
+        "usd": round(spend, 4),
+        "by_provider": rows,
+        # A credit spent outside a logged run (a one-off probe) cannot be
+        # seen here, so the figure is a floor, not a guarantee.
+        "caveat": "Counts logged discovery runs only; ad-hoc calls are not "
+                  "recorded and are not included.",
+    }
 
 
 @app.get("/api/companies/{company_id}/contacts")
@@ -760,10 +956,100 @@ async def get_usage():
     }
 
 
+# ── Contacts / companies: pagination, filtering, search ──
+#
+# These lists used to be "newest 200, no filters", which is fine for a few
+# dozen rows and useless once a directory import puts thousands in. Filters
+# are built as parameterised fragments and shared between the list endpoint
+# and the CSV export, so an export always matches exactly what is on screen.
+
+_CONTACT_SORTS = {
+    "school": "c.name COLLATE NOCASE ASC",
+    "city": "c.city COLLATE NOCASE ASC, c.name COLLATE NOCASE ASC",
+    "added": "p.created_at DESC",
+    "score": "p.score DESC, c.name COLLATE NOCASE ASC",
+}
+_COMPANY_SORTS = {
+    "school": "c.name COLLATE NOCASE ASC",
+    "city": "c.city COLLATE NOCASE ASC, c.name COLLATE NOCASE ASC",
+    "added": "c.created_at DESC",
+    "contacts": "contact_count DESC, c.name COLLATE NOCASE ASC",
+}
+
+
+def _contact_filters(source: str, email_status: str, has_email: str,
+                     primary_only: bool, country: str, state_region: str,
+                     city: str, board: str, q: str) -> tuple[str, list]:
+    where, params = [], []
+    if source:
+        where.append("p.source = ?"); params.append(source)
+    if email_status:
+        where.append("p.email_status = ?"); params.append(email_status)
+    if has_email == "yes":
+        where.append("p.email != ''")
+    elif has_email == "no":
+        where.append("p.email = ''")
+    if primary_only:
+        where.append("p.score >= 100")
+    for col, val in (("c.country", country), ("c.state_region", state_region),
+                     ("c.city", city), ("c.board", board)):
+        if val:
+            where.append(f"{col} = ?"); params.append(val)
+    if q:
+        where.append("(c.name LIKE ? OR p.email LIKE ? "
+                     "OR p.first_name LIKE ? OR p.last_name LIKE ?)")
+        params.extend([f"%{q}%"] * 4)
+    return (" WHERE " + " AND ".join(where) if where else ""), params
+
+
 @app.get("/api/prospects")
-async def get_prospects():
-    rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
-    return rows
+async def get_prospects(
+    page: int = 1, per_page: int = 50, sort: str = "added",
+    source: str = "", email_status: str = "", has_email: str = "",
+    primary_only: bool = False, country: str = "", state_region: str = "",
+    city: str = "", board: str = "", q: str = "",
+):
+    """One page of contacts, with the school's geography joined in."""
+    per_page = max(1, min(200, per_page))
+    page = max(1, page)
+    clause, params = _contact_filters(
+        source, email_status, has_email, primary_only, country,
+        state_region, city, board, q)
+    order = _CONTACT_SORTS.get(sort, _CONTACT_SORTS["added"])
+
+    total_rows = await query_db(
+        f"SELECT COUNT(*) AS n FROM prospects p "
+        f"LEFT JOIN companies c ON c.id = p.company_id{clause}", tuple(params))
+    total = total_rows[0]["n"] if total_rows else 0
+
+    rows = await query_db(
+        f"""SELECT p.*, c.name AS school, c.website, c.domain,
+                   c.country, c.state_region, c.city, c.board,
+                   c.location, c.phone AS company_phone
+            FROM prospects p LEFT JOIN companies c ON c.id = p.company_id
+            {clause} ORDER BY {order} LIMIT ? OFFSET ?""",
+        tuple(params) + (per_page, (page - 1) * per_page))
+    return {"rows": rows, "total": total, "page": page,
+            "per_page": per_page, "pages": max(1, -(-total // per_page))}
+
+
+@app.get("/api/contacts/filters")
+async def get_contact_filters():
+    """Distinct values for the filter dropdowns, counts included."""
+    async def distinct(col: str, table: str = "companies"):
+        return await query_db(
+            f"SELECT {col} AS value, COUNT(*) AS n FROM {table} "
+            f"WHERE {col} IS NOT NULL AND {col} != '' "
+            f"GROUP BY {col} ORDER BY n DESC, {col} ASC")
+    return {
+        "country": await distinct("country"),
+        "state_region": await distinct("state_region"),
+        "city": await distinct("city"),
+        "board": await distinct("board"),
+        "source": await distinct("source", "prospects"),
+        "email_status": await distinct("email_status", "prospects"),
+        "company_source": await distinct("source"),
+    }
 
 
 def _state():

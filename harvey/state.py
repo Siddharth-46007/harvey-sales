@@ -435,6 +435,55 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
+
+    # ── v12: geography and board as their own columns, for filtering ──
+    """
+    -- `location` is a free-text label whose shape depends on the source:
+    -- "Indiranagar, Bengaluru, India" from locality discovery,
+    -- "BANGALORE URBAN, KARNATAKA" from a directory import, and a bare
+    -- "BAHRAIN" for an overseas school. Filtering a dashboard on a
+    -- LIKE over that is guesswork, and every consumer re-invents the
+    -- parsing. These hold the parsed values; `location` stays the
+    -- verbatim provenance string and is never rewritten.
+    --
+    -- Purely additive: no existing column or row is modified. Rows are
+    -- populated by backfill_geography(), which is idempotent and only
+    -- ever fills a blank.
+    ALTER TABLE companies ADD COLUMN country TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN state_region TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN city TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN board TEXT DEFAULT '';
+
+    CREATE INDEX IF NOT EXISTS idx_companies_country ON companies(country);
+    CREATE INDEX IF NOT EXISTS idx_companies_state ON companies(state_region);
+    CREATE INDEX IF NOT EXISTS idx_companies_city ON companies(city);
+    CREATE INDEX IF NOT EXISTS idx_companies_board ON companies(board);
+    CREATE INDEX IF NOT EXISTS idx_companies_source ON companies(source);
+    CREATE INDEX IF NOT EXISTS idx_prospects_score ON prospects(score);
+    CREATE INDEX IF NOT EXISTS idx_prospects_email_status
+        ON prospects(email_status);
+    """,
+
+    # ── v13: the contact extractor's own resume marker ──
+    """
+    -- The extractor used to resume on "this company has no prospects yet",
+    -- which breaks the moment another source writes a prospect row: the
+    -- CBSE import stores a principal for every school, so every imported
+    -- school looked already-extracted and was skipped. A marker of its
+    -- own is set on every attempt, found-something or not, so a site with
+    -- no published address is not retried forever.
+    ALTER TABLE companies ADD COLUMN contacts_checked_at TIMESTAMP DEFAULT NULL;
+    CREATE INDEX IF NOT EXISTS idx_companies_contacts_checked
+        ON companies(contacts_checked_at);
+
+    -- Backfill the companies the extractor has already visited: an
+    -- address found on a website only exists because it ran there.
+    UPDATE companies SET contacts_checked_at = COALESCE(updated_at, created_at)
+    WHERE id IN (
+        SELECT DISTINCT company_id FROM prospects
+        WHERE source LIKE 'found on website%'
+    );
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1518,6 +1567,29 @@ class StateManager:
                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 (company_id,),
             )
+            await db.commit()
+
+    async def mark_contacts_extracted(self, company_id: str,
+                                      phone: str = "") -> None:
+        """Record that the contact extractor read this company's site.
+
+        Set on every attempt, found-something or not, so a site that
+        publishes no address is not re-fetched on every pass. ``phone``
+        fills a blank only: a number from a directory or a human beats one
+        scraped out of a footer, and nothing already recorded is replaced.
+        """
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE companies SET contacts_checked_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (company_id,),
+            )
+            if phone:
+                await db.execute(
+                    "UPDATE companies SET phone = ? "
+                    "WHERE id = ? AND (phone IS NULL OR TRIM(phone) = '')",
+                    (phone, company_id),
+                )
             await db.commit()
 
     async def rename_company(self, company_id: str, name: str):

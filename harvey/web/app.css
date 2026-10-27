@@ -500,6 +500,67 @@ td a:hover { text-decoration: underline; }
 .test-result.error   { background: var(--s-bad-bg);  color: var(--s-bad);  border-color: var(--s-bad-line); }
 .test-result.pending { background: var(--panel-raised); color: var(--text-2); border-color: var(--border); }
 
+/* ── Filter bars and pagers ──────────────────────────────────── */
+/* Companies and Contacts hold thousands of rows after a directory
+   import, so both lists are filtered and paged server-side. The
+   controls borrow .form-input's shape so they read as one family. */
+
+.filter-bar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin: -8px 0 16px;
+}
+.filter-bar select, .filter-search {
+  padding: 6px 9px; font-family: var(--sans); font-size: 12px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm);
+  transition: border-color .15s; max-width: 100%;
+}
+.filter-bar select:focus, .filter-search:focus {
+  outline: none; border-color: var(--text-3);
+}
+.filter-search { min-width: 230px; flex: 1 1 230px; }
+.filter-search::placeholder { color: var(--text-3); }
+.filter-check {
+  display: flex; align-items: center; gap: 6px; padding: 6px 9px;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  font-size: 12px; color: var(--text-2); cursor: pointer; user-select: none;
+}
+.filter-check:has(input:checked) {
+  border-color: var(--text-3); background: var(--panel-raised); color: var(--text);
+}
+.filter-check input { accent-color: var(--ink); }
+
+.pager {
+  display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+  margin-top: 14px; font-size: 12px; color: var(--text-2);
+}
+.pager:empty { display: none; }
+.pager-count, .pager-page {
+  font-family: var(--mono); font-size: 11px; color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.pager-count { margin-right: auto; }
+.pager-page { margin: 0 3px; }
+.pager .btn[disabled] { opacity: .4; cursor: default; }
+
+/* ── Coverage panel (Today) ──────────────────────────────────── */
+
+.cov-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden;
+}
+.cov-cell {
+  padding: 11px 13px; border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+.cov-cell:last-child { border-right: none; }
+.cov-value {
+  font-family: var(--mono); font-size: 19px; line-height: 1.1;
+  letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+}
+.cov-label { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+#progress-panel .warn { color: var(--s-wait); }
+
 /* ── Setup checklist ─────────────────────────────────────────── */
 
 .progress-wrap { margin-bottom: 18px; }

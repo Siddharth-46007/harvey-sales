@@ -590,13 +590,22 @@ def cmd_contacts(args):
                "FROM companies c WHERE c.domain != ''")
         params: list = []
         if not args.redo:
-            # Resumability: a company that already has contacts is skipped,
-            # so an interrupted run picks up exactly where it stopped.
-            sql += (" AND NOT EXISTS (SELECT 1 FROM prospects p "
-                    "WHERE p.company_id = c.id)")
+            # Resumability: skip the sites this pass has already read, so an
+            # interrupted run picks up exactly where it stopped. The marker
+            # is the extractor's own — "has any prospect" would skip every
+            # school the CBSE import stored a principal for.
+            sql += " AND c.contacts_checked_at IS NULL"
         if args.location:
-            sql += " AND UPPER(c.location) LIKE ?"
-            params.append(f"%{args.location.upper()}%")
+            # Matches the parsed state/country/city as well as the raw label,
+            # so --location Karnataka reaches directory rows written as
+            # "BANGALORE URBAN, KARNATAKA" and discovery rows written as
+            # "Indiranagar, Bengaluru, India" alike.
+            like = f"%{args.location.upper()}%"
+            sql += (" AND (UPPER(c.location) LIKE ?"
+                    " OR UPPER(c.state_region) LIKE ?"
+                    " OR UPPER(c.country) LIKE ?"
+                    " OR UPPER(c.city) LIKE ?)")
+            params.extend([like, like, like, like])
         sql += " ORDER BY c.created_at"
         if args.limit:
             sql += f" LIMIT {int(args.limit)}"
@@ -627,6 +636,8 @@ def cmd_contacts(args):
         print(f"    {t['free_mail']} of those are free-mail "
               f"(gmail/yahoo/rediffmail/outlook)")
         print(f"    {t['phone_only']} phone only, {t['neither']} neither")
+        print(f"    {t['phones_found']} phone numbers read "
+              f"({t['phones_stored']} saved on schools that had none)")
         print(f"    {t['added']} contacts stored")
         print("\n  Review: harvey dashboard -> Contacts, "
               "or harvey export --all\n")

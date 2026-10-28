@@ -460,6 +460,12 @@ def _company_filters(source: str, country: str, state_region: str, city: str,
     return (" WHERE " + " AND ".join(where) if where else ""), params
 
 
+async def _count_all(table: str) -> int:
+    """Every row in a table, ignoring any filter."""
+    rows = await query_db(f"SELECT COUNT(*) AS n FROM {table}")
+    return rows[0]["n"] if rows else 0
+
+
 @app.get("/api/companies")
 async def get_companies(
     page: int = 1, per_page: int = 50, sort: str = "added",
@@ -479,6 +485,10 @@ async def get_companies(
     total_rows = await query_db(
         f"SELECT COUNT(*) AS n FROM companies c{clause}", tuple(params))
     total = total_rows[0]["n"] if total_rows else 0
+    # "Showing X of Y": Y is everything in the table, so a narrowed view
+    # says what it is hiding. With no filter the two are the same count and
+    # there is nothing to ask the database twice for.
+    grand_total = total if not clause else await _count_all("companies c")
 
     rows = await query_db(
         f"""SELECT c.*,
@@ -488,8 +498,9 @@ async def get_companies(
                     AND p.email != '') AS email_count
             FROM companies c {clause} ORDER BY {order} LIMIT ? OFFSET ?""",
         tuple(params) + (per_page, (page - 1) * per_page))
-    return {"rows": rows, "total": total, "page": page,
-            "per_page": per_page, "pages": max(1, -(-total // per_page))}
+    return {"rows": rows, "total": total, "grand_total": grand_total,
+            "page": page, "per_page": per_page,
+            "pages": max(1, -(-total // per_page))}
 
 
 @app.get("/api/export/contacts.csv")
@@ -1021,6 +1032,7 @@ async def get_prospects(
         f"SELECT COUNT(*) AS n FROM prospects p "
         f"LEFT JOIN companies c ON c.id = p.company_id{clause}", tuple(params))
     total = total_rows[0]["n"] if total_rows else 0
+    grand_total = total if not clause else await _count_all("prospects p")
 
     rows = await query_db(
         f"""SELECT p.*, c.name AS school, c.website, c.domain,
@@ -1029,8 +1041,9 @@ async def get_prospects(
             FROM prospects p LEFT JOIN companies c ON c.id = p.company_id
             {clause} ORDER BY {order} LIMIT ? OFFSET ?""",
         tuple(params) + (per_page, (page - 1) * per_page))
-    return {"rows": rows, "total": total, "page": page,
-            "per_page": per_page, "pages": max(1, -(-total // per_page))}
+    return {"rows": rows, "total": total, "grand_total": grand_total,
+            "page": page, "per_page": per_page,
+            "pages": max(1, -(-total // per_page))}
 
 
 @app.get("/api/contacts/filters")

@@ -1584,6 +1584,23 @@ async function loadFilterOptions(force) {
   fillSelect('co-board', f.board, 'Any board');
 }
 
+// "Showing 122 of 3,753 schools" — the filtered count against everything in
+// the table, so a narrowed view says what it is hiding. Both numbers come
+// from the same response the rows did, never from counting what is on screen.
+function filterCount(target, data, noun, nounPlural) {
+  const el = document.getElementById(target);
+  if (!el) return;
+  if (!data) { el.textContent = ''; return; }
+  const shown = data.total || 0;
+  const all = data.grand_total == null ? shown : data.grand_total;
+  const word = all === 1 ? noun : nounPlural;
+  el.textContent = shown === all
+    ? all.toLocaleString() + ' ' + word
+    : 'Showing ' + shown.toLocaleString() + ' of ' +
+      all.toLocaleString() + ' ' + word;
+  el.classList.toggle('filtered', shown !== all);
+}
+
 function pager(target, data, fn) {
   const el = document.getElementById(target);
   if (!el) return;
@@ -1633,7 +1650,12 @@ async function loadCompanies() {
   const el = document.getElementById('companies-list');
   await loadFilterOptions();
   const data = await api('/api/companies?' + companyQuery());
-  if (!data) { el.innerHTML = offlineState(); return; }
+  if (!data) {
+    el.innerHTML = offlineState();
+    filterCount('co-count', null);
+    return;
+  }
+  filterCount('co-count', data, 'company', 'companies');
   const rows = data.rows || [];
   _companies = rows;
   if (!rows.length) {
@@ -1747,7 +1769,12 @@ async function loadProspects() {
   const el = document.getElementById('prospects-table');
   await loadFilterOptions();
   const data = await api('/api/prospects?' + contactQuery());
-  if (!data) { el.innerHTML = offlineState(); return; }
+  if (!data) {
+    el.innerHTML = offlineState();
+    filterCount('ct-count', null);
+    return;
+  }
+  filterCount('ct-count', data, 'contact', 'contacts');
   const rows = data.rows || [];
   _prospects = rows;
   if (!rows.length) {

@@ -120,6 +120,43 @@ def test_a_page_past_the_end_is_empty_not_an_error(client):
     assert d["rows"] == [] and d["total"] == len(CONTACTS)
 
 
+# ── "Showing X of Y" ──
+
+
+def test_unfiltered_view_shows_the_whole_table(client):
+    d = client.get("/api/prospects").json()
+    assert d["total"] == d["grand_total"] == len(CONTACTS)
+    d = client.get("/api/companies").json()
+    assert d["total"] == d["grand_total"] == len(SCHOOLS)
+
+
+def test_a_filtered_view_still_reports_the_table_total(client):
+    """X is what matches, Y is everything — so a narrowed view says what it
+    is hiding."""
+    d = client.get("/api/prospects?state_region=Karnataka").json()
+    assert d["total"] == 3
+    assert d["grand_total"] == len(CONTACTS)
+
+    d = client.get("/api/companies?has_website=no").json()
+    assert d["total"] == 1
+    assert d["grand_total"] == len(SCHOOLS)
+
+
+def test_the_count_is_the_whole_result_not_the_page(client):
+    """Paging must not change either number."""
+    d = client.get("/api/prospects?per_page=2&page=1").json()
+    assert len(d["rows"]) == 2
+    assert d["total"] == len(CONTACTS)
+    assert d["grand_total"] == len(CONTACTS)
+
+
+def test_a_search_that_matches_nothing_reports_zero_of_the_total(client):
+    d = client.get("/api/prospects?q=nothing-here").json()
+    assert d["total"] == 0 and d["grand_total"] == len(CONTACTS)
+    d = client.get("/api/companies?q=nothing-here").json()
+    assert d["total"] == 0 and d["grand_total"] == len(SCHOOLS)
+
+
 # ── Contact filters ──
 
 

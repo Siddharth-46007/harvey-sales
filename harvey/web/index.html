@@ -180,6 +180,7 @@
     <select id="co-sort" onchange="reloadCompanies()"><option value="added">Newest</option><option value="school">Name A&ndash;Z</option><option value="city">City</option><option value="contacts">Most contacts</option></select>
     <select id="co-per" onchange="reloadCompanies()"><option value="50">50 / page</option><option value="100">100 / page</option></select>
     <button class="btn btn-secondary btn-sm" onclick="clearCompanyFilters()">Clear</button>
+    <span class="filter-count" id="co-count"></span>
   </div>
   <div id="companies-list"></div>
   <div class="pager" id="co-pager"></div>
@@ -208,6 +209,7 @@
     <select id="ct-per" onchange="reloadProspects()"><option value="50">50 / page</option><option value="100">100 / page</option></select>
     <label class="filter-check"><input type="checkbox" id="ct-primary" onchange="reloadProspects()"> Primary only</label>
     <button class="btn btn-secondary btn-sm" onclick="clearContactFilters()">Clear</button>
+    <span class="filter-count" id="ct-count"></span>
   </div>
   <div id="prospects-table"></div>
   <div class="pager" id="ct-pager"></div>
